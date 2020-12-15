@@ -1,0 +1,90 @@
+from datetime import timedelta
+import json    
+import pandas as pd
+import numpy as np
+import streamlit as st      
+import plotly.graph_objects as go
+from clickhouse_driver import Client
+
+
+def add_session_id(df):
+    df = df.sort_values(['AppmetricaDeviceId', 'EventDatetime'])
+    prev = df.shift()
+    df['session_id'] = (
+        (df.AppmetricaDeviceId != prev.AppmetricaDeviceId) |
+        ((df.EventDatetime - prev.EventDatetime).dt.total_seconds() > 1800)
+    ).cumsum()
+    return df
+
+def load_data():
+    client = Client('0vm0001.prod.kassa.rambler.tech', database='kassa')
+    result, columns = client.execute("""SELECT
+                                        *
+                                        FROM AppMetricaEvent 
+                                        WHERE ApplicationId == 3324766
+                                        AND toYYYYMM(EventDatetime) == 202011 
+                                    """, with_column_types=True)
+    df = pd.DataFrame(result, columns=[tuple[0] for tuple in columns])
+    df = add_session_id(df)
+    df['EventDatetime'] = pd.to_datetime(df.EventDatetime, unit='s')
+    parsed_json = df[(~df.EventJson.isna())&(df.EventJson!='')].EventJson.apply(json.loads)
+    df['creationId'] = parsed_json[parsed_json.apply(
+        lambda x: 'creationId' in x)].apply(lambda x: int(x['creationId']))
+    df["isInstantApp"] = parsed_json[parsed_json.apply(
+        lambda x: "isInstantApp" in x)].apply(lambda x: x["isInstantApp"])
+    df['isInstantApp'] = np.where(df['isInstantApp']=='false', False, df['isInstantApp'])
+    df['isInstantApp'] = np.where(df['isInstantApp']=='true', True, df['isInstantApp'])
+    df['isInstantApp'] = df.isInstantApp.fillna(False)
+    return df 
+
+df = load_data()
+df = df[df.EventName.str.contains('Appear')]
+df = df[df.isInstantApp == False]
+
+
+start = st.sidebar.date_input('start', df.EventDatetime.dt.date.min())
+end = st.sidebar.date_input('end', df.EventDatetime.dt.date.max() + timedelta(days=1))
+df = df[(df.EventDatetime.dt.date >= start)&(df.EventDatetime.dt.date < end)]
+
+# только первые сессии
+#onboarding_session_ids = df[df.EventName=='OnboardingScreenAppear'].session_id.unique()
+#df = df[df.session_id.isin(onboarding_session_ids)]
+
+if len(df) == 0:
+    st.error("No data in selected time period")
+
+g_df = df.groupby(['session_id', ])
+df2 = pd.DataFrame(g_df.EventName.apply(list))
+transitions = {}
+for i in df2.EventName:
+    for a, b in zip(i, i[1:]):
+        if 'movie' in a or 'movie' in b:
+            if (a, b) in transitions:
+                transitions[(a, b)] += 1
+            else:
+                transitions[(a, b)] = 1
+transitions = {k: v for k, v in transitions.items() if v > 80}
+
+labels = list(set(i[0] for i in transitions) | set(i[1] for i in transitions))
+
+node = {
+    "label": labels,
+ #   "x": [pos[i][0] / 4 for i in labels],
+ #   "y": [pos[i][1] / 4 for i in labels],
+    "pad": 50,
+}
+
+link = {
+    "source": [labels.index(i[0]) for i in transitions.keys()],
+    "target": [labels.index(i[1]) for i in transitions.keys()],
+    "value": [i for i in transitions.values()],
+}
+
+fig = go.Figure(go.Sankey(
+    arrangement="snap",
+    node=node,
+    link=link,
+))
+
+
+st.write(fig)
